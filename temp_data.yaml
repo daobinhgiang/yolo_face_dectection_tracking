@@ -1,0 +1,5 @@
+names:
+- face
+nc: 1
+train: /home/daobinhgiang/projects/object_dect+tracking/images/train
+val: /home/daobinhgiang/projects/object_dect+tracking/images/val
