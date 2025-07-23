@@ -26,7 +26,7 @@ def track_faces_and_save_video(
     out = cv2.VideoWriter(output_video_path, fourcc, fps, (width, height))
 
     # Calculate maximum frames for 20 seconds
-    max_frames = int(fps * 20)  # 20 seconds worth of frames
+    max_frames = int(fps * 10)  # 20 seconds worth of frames
     print(f"Processing first 20 seconds ({max_frames} frames) of video at {fps} FPS")
 
     # Initialize tracker
@@ -61,7 +61,7 @@ def track_faces_and_save_video(
         detections = [xyxy_to_xywh(box) for box in boxes_xyxy]
 
         # Tracking
-        track_results = tracker.update(detections)
+        track_results = tracker.update(detections, frame)
 
         # Draw tracking results
         for result in track_results:
@@ -73,13 +73,23 @@ def track_faces_and_save_video(
             # Draw bounding box
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
-            # Draw track ID
-            cv2.putText(frame, f"ID:{track_id}", (x1, y1 - 10),
+            # Fetch name/info from tracker
+            tracker_obj = tracker.trackers[track_id]
+            if tracker_obj.person_info is not None:
+                label = tracker_obj.person_info.get("Name")
+            else:
+                label = f"Unknown"
+
+            # print (label)
+            cv2.putText(frame, label, (x1, y1 - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
         # Write frame to output video
         out.write(frame)
         frame_num += 1
+
+        cv2.imshow("temp", frame)
+        cv2.waitKey(1)
 
         # Progress update every 100 frames
         if frame_num % 100 == 0:
@@ -95,13 +105,13 @@ def track_faces_and_save_video(
     print(f"Output saved to {output_video_path}")
 
 
-best_model = "/home/giangdb/Documents/ETC/face_tracking_api/best.pt"
+best_model = YOLO("/home/giangdb/Documents/ETC/face_tracking_api/best.pt")
 track_faces_and_save_video(
-    input_video_path="/kaggle/input/ppl-walking-small/People Walking Free Stock Footage Royalty-Free No Copyright Content(1).mp4",
-    output_video_path="/kaggle/working/output.mp4",
+    input_video_path="/home/giangdb/Documents/ETC/face_tracking_api/People Walking Free Stock Footage, Royalty-Free No Copyright Content(1).mp4",
+    output_video_path="output1.mp4",
     yolo_model=best_model,
     face_class=0,  # change if your face class index differs
     conf_thresh=0.4,  # detection confidence threshold
-    max_disappeared=60,  # how many frames to keep lost tracks
+    max_disappeared=1000,  # how many frames to keep lost tracks
     iou_threshold=0.3  # IOU threshold for matching
 )

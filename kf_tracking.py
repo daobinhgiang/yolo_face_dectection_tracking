@@ -1,10 +1,13 @@
+import time
+
 from ultralytics import YOLO
 from scipy.optimize import linear_sum_assignment
-
+from name_process import crop_and_encode_face, get_face_embedding, get_person_info
+import ast
 import numpy as np
 import cv2
 
-best_model=YOLO('/home/giangdb/Documents/ETC/face_tracking_api/best.pt')
+best_model = YOLO('/home/giangdb/Documents/ETC/face_tracking_api/best.pt')
 
 
 class KalmanTracker:
@@ -16,6 +19,7 @@ class KalmanTracker:
         self.age = 0
         self.hits = 0
         self.time_since_update = 0
+        self.person_info = None  # To store person's info
 
         # State vector: [x, y, w, h, vx, vy, vw, vh]
         # Position and velocity for center coordinates and dimensions
@@ -66,6 +70,9 @@ class KalmanTracker:
         # Return predicted bounding box [x_center, y_center, width, height]
         return predicted_state[:4].flatten()
 
+    def set_info(self, info):
+        self.person_info = info
+
     def update(self, bbox):
         """Update the Kalman filter with a new measurement"""
         self.time_since_update = 0
@@ -85,7 +92,7 @@ class KalmanTracker:
 class MultiObjectTracker:
     def __init__(self, max_disappeared=20, iou_threshold=0.3):
         self.next_id = 0
-        self.trackers = []
+        self.trackers = {}
         self.max_disappeared = max_disappeared
         self.iou_threshold = iou_threshold
 
@@ -115,95 +122,87 @@ class MultiObjectTracker:
 
         return intersection / union if union > 0 else 0
 
-    def associate_detections_to_trackers(self, detections, predictions):
-        """Associate detections to existing trackers using IoU"""
+    def associate_detections_to_trackers(self, detections, predictions, tracker_ids):
+        """
+        Modified: Accepts tracker_ids so we can match detection <-> tracker_id robustly.
+        """
         if len(predictions) == 0:
             return [], list(range(len(detections))), []
 
         if len(detections) == 0:
-            return [], [], list(range(len(predictions)))
+            return [], [], list(tracker_ids)
 
-        # Calculate IoU matrix
         iou_matrix = np.zeros((len(detections), len(predictions)))
         for d, det in enumerate(detections):
             for t, pred in enumerate(predictions):
                 iou_matrix[d, t] = self.calculate_iou(det, pred)
 
-        # Use Hungarian algorithm for optimal assignment
-        if min(iou_matrix.shape) > 0:
-            a = (iou_matrix > self.iou_threshold).astype(np.int32)
-            if a.sum(1).max() == 1 and a.sum(0).max() == 1:
-                matched_indices = np.stack(np.where(a), axis=1)
-            else:
-                matched_indices = linear_sum_assignment(-iou_matrix)
-                matched_indices = np.array(list(zip(*matched_indices)))
-        else:
-            matched_indices = np.empty(shape=(0, 2))
+        matched_indices = linear_sum_assignment(-iou_matrix)
+        matched_indices = np.array(list(zip(*matched_indices)))
 
-        # Filter out matched pairs with low IoU
+        # Filter out low IoU
         matches = []
         for m in matched_indices:
-            if iou_matrix[m[0], m[1]] < self.iou_threshold:
-                continue
-            matches.append(m.reshape(2))
+            if iou_matrix[m[0], m[1]] >= self.iou_threshold:
+                matches.append((m[0], m[1]))
 
-        if len(matches) == 0:
-            matches = np.empty((0, 2), dtype=int)
-        else:
-            matches = np.array(matches)
+        matched_det_indices = set(m[0] for m in matches)
+        matched_trk_indices = set(m[1] for m in matches)
 
-        # Identify unmatched detections and trackers
-        unmatched_detections = []
-        for d, det in enumerate(detections):
-            if len(matches) == 0 or d not in matches[:, 0]:
-                unmatched_detections.append(d)
+        unmatched_detections = [i for i in range(len(detections)) if i not in matched_det_indices]
+        unmatched_tracker_ids = [tracker_ids[i] for i in range(len(predictions)) if i not in matched_trk_indices]
 
-        unmatched_trackers = []
-        for t, trk in enumerate(self.trackers):
-            if len(matches) == 0 or t not in matches[:, 1]:
-                unmatched_trackers.append(t)
+        return matches, unmatched_detections, unmatched_tracker_ids
 
-        return matches, unmatched_detections, unmatched_trackers
-
-    def update(self, detections):
+    def update(self, detections, frame):
         """
-        Update trackers with new detections
-        detections: list of bounding boxes [[x_center, y_center, width, height], ...]
+        Update trackers with new detections.
+        Returns: list of dicts, each {'id', 'bbox', 'hits', 'age'}
         """
-        # Predict next positions for all trackers
-        predictions = []
-        for tracker in self.trackers:
-            pred = tracker.predict()
-            predictions.append(pred)
+        tracker_ids = list(self.trackers.keys())
+        predictions = [self.trackers[tid].predict() for tid in tracker_ids]
 
-        # Associate detections to trackers
-        matches, unmatched_dets, unmatched_trks = self.associate_detections_to_trackers(
-            detections, predictions
+        matches, unmatched_dets, unmatched_trk_ids = self.associate_detections_to_trackers(
+            detections, predictions, tracker_ids
         )
 
-        # Update matched trackers with assigned detections
-        for m in matches:
-            self.trackers[m[1]].update(detections[m[0]])
+        # Update matched trackers
+        for det_idx, trk_idx in matches:
+            track_id = tracker_ids[trk_idx]
+            self.trackers[track_id].update(detections[det_idx])
+
+        # Increment time_since_update for unmatched trackers
+        for track_id in unmatched_trk_ids:
+            self.trackers[track_id].time_since_update += 1
 
         # Create new trackers for unmatched detections
-        for i in unmatched_dets:
-            tracker = KalmanTracker(detections[i], self.next_id)
-            self.trackers.append(tracker)
+        for det_idx in unmatched_dets:
+            tracker = KalmanTracker(detections[det_idx], self.next_id)
+            self.trackers[self.next_id] = tracker
             self.next_id += 1
 
-        # Remove dead trackers
-        self.trackers = [
-            tracker for tracker in self.trackers
-            if tracker.time_since_update <= self.max_disappeared
-        ]
+        # Remove trackers that have disappeared for too long
+        to_remove = [tid for tid, tracker in self.trackers.items() if tracker.time_since_update > self.max_disappeared]
+        for tid in to_remove:
+            del self.trackers[tid]
 
-        # Return current tracking results
+        # Return results for all active trackers
         results = []
-        for tracker in self.trackers:
-            if tracker.time_since_update <= 1:  # Only return recent tracks
+        for track_id, tracker in self.trackers.items():
+            if tracker.time_since_update <= 1:
                 bbox = tracker.get_state()
+                if tracker.person_info is None:
+                    base64_img = crop_and_encode_face(frame, bbox)
+                    start = time.time()
+                    embedding = get_face_embedding(base64_img)
+                    info = get_person_info(embedding)
+                    end = time.time()
+                    print(end - start)
+                    tracker.set_info(info)
+                # if info is not None:
+                #     tracker.set_info(info)
                 results.append({
-                    'id': tracker.track_id,
+                    'id': track_id,
                     'bbox': bbox,
                     'hits': tracker.hits,
                     'age': tracker.age
